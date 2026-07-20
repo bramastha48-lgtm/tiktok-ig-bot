@@ -1,57 +1,49 @@
-# 🎬 TikTok & Instagram Video Downloader Bot
+# 🎬 Universal Video Downloader Bot
 
-Telegram bot untuk download video TikTok (tanpa watermark) dan Instagram Reels.
+Telegram bot untuk download video/foto/audio dari berbagai platform tanpa watermark.
 
-## Fitur
-- ✅ TikTok tanpa watermark (HD)
-- ✅ Instagram Reels
-- ✅ Auto detect link
-- ✅ Kirim video langsung di Telegram
+## ✅ Support Platform
 
-## Setup
+| Platform | Video | Audio | Foto |
+|----------|-------|-------|------|
+| TikTok | ✅ No watermark | ✅ MP3 | - |
+| Instagram | ✅ Reel | - | ✅ Carousel |
+| YouTube | ✅ Shorts | - | - |
+| Twitter/X | ✅ | - | - |
+| Pinterest | ✅ | - | ✅ |
+
+## 📌 Commands
+
+- `/start` — Mulai bot
+- `/help` — Bantuan
+- `/audio <link>` — Download audio TikTok (MP3)
+
+## 🚀 Setup
 
 ### 1. Buat Bot Telegram
-1. Chat @BotFather di Telegram
-2. Kirim `/newbot`
-3. Ikuti instruksi, dapatkan **BOT_TOKEN**
+1. Chat @BotFather
+2. `/newbot` → ikuti instruksi
+3. Simpan BOT_TOKEN
 
-### 2. Install Dependencies
+### 2. Install
 ```bash
 pip install -r requirements.txt
 ```
 
-### 3. Set Bot Token
+### 3. Jalankan
 ```bash
-# Linux/Mac
-export BOT_TOKEN="123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11"
-
-# Windows
-set BOT_TOKEN=123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11
-```
-
-### 4. Jalankan
-```bash
+export BOT_TOKEN="***"
 python bot.py
 ```
 
-## Cara Pakai
-1. Buka bot di Telegram
-2. Kirim `/start`
-3. Copy link TikTok/Instagram
-4. Kirim link ke bot
-5. Tunggu, video akan dikirim tanpa watermark!
+## 🌐 Deploy 24/7 (Railway)
+1. Push ke GitHub
+2. Login https://railway.app
+3. New Project → Deploy from GitHub
+4. Add variable: `BOT_TOKEN` = token BotFather
+5. Deploy ✅
 
-## Contoh Link
-- `https://www.tiktok.com/@user/video/123456`
-- `https://vm.tiktok.com/xxxxxxx`
-- `https://www.instagram.com/reel/xxxxxxx`
-- `https://www.instagram.com/p/xxxxxxx`
-
-## Deploy 24/7 (Opsional)
-```bash
-# Pakai nohup
-nohup python bot.py &
-
-# Atau pakai systemd (Linux)
-# Buat file /etc/systemd/system/tiktok-bot.service
-```
+## 💡 Cara Pakai
+1. Copy link video dari TikTok/Instagram/YouTube/Twitter/Pinterest
+2. Kirim link ke bot
+3. Tunggu, media dikirim tanpa watermark!
