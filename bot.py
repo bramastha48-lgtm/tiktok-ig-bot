@@ -434,47 +434,84 @@ async def photos_to_video(image_paths: list, audio_path: str, output_path: str,
                           duration_per_image: float = 3.0) -> bool:
     """Gabungkan foto + audio jadi video slideshow."""
     try:
-        import subprocess
+        # Step 0: Validasi file ada
+        valid_images = [p for p in image_paths if Path(p).exists() and Path(p).stat().st_size > 0]
+        if not valid_images:
+            logger.error("No valid images for slideshow")
+            return False
+        if not Path(audio_path).exists():
+            logger.error(f"Audio file not found: {audio_path}")
+            return False
 
-        # Buat file list untuk ffmpeg concat
-        list_file = DOWNLOAD_DIR / f"concat_{hash(output_path) & 0xFFFFFFFF:08x}.txt"
-        with open(list_file, 'w') as f:
-            for img in image_paths:
-                f.write(f"file '{img}'\n")
-                f.write(f"duration {duration_per_image}\n")
-            # Repeat last image supaya transisi halus
-            f.write(f"file '{image_paths[-1]}'\n")
+        # Step 1: Convert semua gambar ke JPEG (hindari masalah WEBP/PNG/transparency)
+        jpeg_dir = DOWNLOAD_DIR / f"jpeg_{hash(output_path) & 0xFFFFFFFF:08x}"
+        jpeg_dir.mkdir(exist_ok=True)
+        jpeg_paths = []
+        for i, img in enumerate(valid_images):
+            jpeg_path = jpeg_dir / f"img_{i:03d}.jpg"
+            proc = await asyncio.create_subprocess_exec(
+                'ffmpeg', '-i', img, '-vf',
+                'scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2',
+                '-pix_fmt', 'yuv420p', '-q:v', '2', '-y', str(jpeg_path),
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE
+            )
+            _, stderr = await proc.communicate()
+            if proc.returncode == 0 and jpeg_path.exists():
+                jpeg_paths.append(str(jpeg_path))
+            else:
+                logger.error(f"Convert image {i} failed: {stderr.decode()[:200]}")
 
-        # Hitung total durasi audio
-        probe_cmd = [
+        if not jpeg_paths:
+            logger.error("No images converted to JPEG")
+            return False
+
+        # Step 2: Hitung durasi audio (async)
+        probe_proc = await asyncio.create_subprocess_exec(
             'ffprobe', '-v', 'quiet', '-show_entries', 'format=duration',
-            '-of', 'csv=p=0', audio_path
-        ]
-        probe = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=10)
-        audio_dur = float(probe.stdout.strip()) if probe.stdout.strip() else 30.0
+            '-of', 'csv=p=0', audio_path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL
+        )
+        probe_out, _ = await probe_proc.communicate()
+        try:
+            audio_dur = float(probe_out.decode().strip())
+        except ValueError:
+            audio_dur = 30.0
 
-        # Sesuaikan durasi per gambar supaya total = audio duration
-        dur_per = audio_dur / len(image_paths)
+        # Step 3: Buat concat file list
+        dur_per = audio_dur / len(jpeg_paths)
+        list_file = jpeg_dir / "concat.txt"
         with open(list_file, 'w') as f:
-            for img in image_paths:
-                f.write(f"file '{img}'\n")
+            for img in jpeg_paths:
+                # Escape single quotes di path
+                safe_path = img.replace("'", "'\''")
+                f.write(f"file '{safe_path}'\n")
                 f.write(f"duration {dur_per:.2f}\n")
-            f.write(f"file '{image_paths[-1]}'\n")
+            # Repeat last image
+            safe_last = jpeg_paths[-1].replace("'", "'\''")
+            f.write(f"file '{safe_last}'\n")
 
-        # Buat slideshow video dari gambar
+        # Step 4: Buat video
         proc = await asyncio.create_subprocess_exec(
             'ffmpeg', '-f', 'concat', '-safe', '0', '-i', str(list_file),
             '-i', audio_path,
             '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
-            '-vf', 'scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2',
             '-c:a', 'aac', '-b:a', '192k',
-            '-shortest', '-y', output_path,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL
+            '-shortest', '-movflags', '+faststart',
+            '-y', output_path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
         )
-        await proc.wait()
+        stdout, stderr = await proc.communicate()
 
-        list_file.unlink(missing_ok=True)
+        if proc.returncode != 0:
+            logger.error(f"ffmpeg slideshow error: {stderr.decode()[:500]}")
+
+        # Cleanup jpeg dir
+        import shutil
+        shutil.rmtree(jpeg_dir, ignore_errors=True)
+
         return Path(output_path).exists() and Path(output_path).stat().st_size > 0
     except Exception as e:
         logger.error(f"Photos to video error: {e}")
@@ -940,7 +977,14 @@ async def handle_slideshow_callback(update: Update, context: ContextTypes.DEFAUL
         status_msg = await query.message.reply_text("🎬 Menggabungkan foto + audio jadi video...")
 
         video_path = str(DOWNLOAD_DIR / f"slideshow_{slide_key}.mp4")
-        success = await photos_to_video(paths, audio_path, video_path)
+        try:
+            success = await asyncio.wait_for(
+                photos_to_video(paths, audio_path, video_path),
+                timeout=120  # 2 menit max
+            )
+        except asyncio.TimeoutError:
+            success = False
+            logger.error("Slideshow video creation timed out")
 
         if success:
             vid_file = Path(video_path)
@@ -961,7 +1005,7 @@ async def handle_slideshow_callback(update: Update, context: ContextTypes.DEFAUL
                 await status_msg.delete()
                 vid_file.unlink(missing_ok=True)
         else:
-            await status_msg.edit_text("❌ Gagal membuat video.")
+            await status_msg.edit_text("❌ Gagal membuat video. Coba lagi nanti.")
 
         _cleanup_slideshow_files(slide)
         _slideshow_cache.pop(slide_key, None)
