@@ -270,14 +270,21 @@ async def download_tiktok(url: str, audio_only: bool = False, progress_hook=None
                 if downloaded:
                     # Download audio untuk photo slideshow
                     audio_path = None
-                    audio_url = video_data.get("play") or video_data.get("hdplay")
-                    if audio_url:
-                        if not audio_url.startswith("http"):
-                            audio_url = "https://www.tikwm.com" + audio_url
+                    # Cek beberapa sumber audio dari TikWM
+                    audio_url = (
+                        video_data.get("play") or
+                        video_data.get("hdplay") or
+                        (video_data.get("music", {}) or {}).get("play") or
+                        (video_data.get("music_info", {}) or {}).get("play") or
+                        video_data.get("music")
+                    )
+                    logger.info(f"TikWM photo audio URL: {audio_url}")
+
+                    if audio_url and isinstance(audio_url, str) and audio_url.startswith("http"):
                         try:
                             async with httpx.AsyncClient(timeout=120, follow_redirects=True) as client:
                                 aresp = await client.get(audio_url)
-                                if aresp.status_code == 200:
+                                if aresp.status_code == 200 and len(aresp.content) > 1000:
                                     tmp_a = DOWNLOAD_DIR / f"tmp_paudio_{hash(url) & 0xFFFFFFFF:08x}.mp4"
                                     tmp_a.write_bytes(aresp.content)
                                     mp3 = DOWNLOAD_DIR / f"tiktok_paudio_{hash(url) & 0xFFFFFFFF:08x}.mp3"
@@ -285,8 +292,36 @@ async def download_tiktok(url: str, audio_only: bool = False, progress_hook=None
                                     tmp_a.unlink(missing_ok=True)
                                     if ok and mp3.exists():
                                         audio_path = str(mp3)
+                                        logger.info(f"Photo audio downloaded: {audio_path}")
                         except Exception as e:
                             logger.error(f"Photo audio download error: {e}")
+
+                    # Fallback: download audio via yt-dlp
+                    if not audio_path:
+                        logger.info("TikWM audio not found, trying yt-dlp for audio...")
+                        try:
+                            ydl_opts = {
+                                'format': 'bestaudio/best',
+                                'outtmpl': str(DOWNLOAD_DIR / f'tt_fallback_audio_{hash(url) & 0xFFFFFFFF:08x}.%(ext)s'),
+                                'quiet': True,
+                                'no_warnings': True,
+                                'socket_timeout': 30,
+                                'postprocessors': [{
+                                    'key': 'FFmpegExtractAudio',
+                                    'preferredcodec': 'mp3',
+                                    'preferredquality': '192',
+                                }],
+                            }
+                            loop = asyncio.get_event_loop()
+                            await loop.run_in_executor(None, _run_ytdlp, url, ydl_opts)
+                            # Cari file mp3 hasil download
+                            for f in DOWNLOAD_DIR.glob('tt_fallback_audio_*'):
+                                if f.exists() and f.suffix == '.mp3' and f.stat().st_size > 0:
+                                    audio_path = str(f)
+                                    logger.info(f"Fallback audio downloaded: {audio_path}")
+                                    break
+                        except Exception as e:
+                            logger.error(f"Fallback audio download error: {e}")
 
                     result = {
                         "success": True, "type": "photos",
@@ -956,7 +991,10 @@ async def handle_slideshow_callback(update: Update, context: ContextTypes.DEFAUL
     # === AUDIO ONLY ===
     elif action == "sa":
         if not audio_path or not Path(audio_path).exists():
-            await query.answer("Audio tidak tersedia.", show_alert=True)
+            await query.answer(
+                "Audio tidak tersedia untuk post ini.",
+                show_alert=True
+            )
             return
         await query.answer("🎵 Mengirim audio...")
         caption = safe_caption("🎵", title, author, f"📦 {format_size(Path(audio_path).stat().st_size)}")
@@ -971,7 +1009,10 @@ async def handle_slideshow_callback(update: Update, context: ContextTypes.DEFAUL
     # === GABUNG JADI VIDEO ===
     elif action == "sv":
         if not audio_path or not Path(audio_path).exists():
-            await query.answer("Audio tidak tersedia untuk digabung.", show_alert=True)
+            await query.answer(
+                "Audio tidak tersedia. Coba opsi Foto Only atau Audio Only.",
+                show_alert=True
+            )
             return
         await query.answer("🎬 Membuat video...")
         status_msg = await query.message.reply_text("🎬 Menggabungkan foto + audio jadi video...")
