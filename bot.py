@@ -45,6 +45,8 @@ PROGRESS_INTERVAL = 2  # detik antara update progress
 # Cache URL untuk callback (Telegram callback_data limit = 64 bytes)
 # key = short_hash, value = (platform, url)
 _url_cache: dict[str, tuple[str, str]] = {}
+# Cache slideshow data: key = short_hash, value = dict with paths, audio, metadata
+_slideshow_cache: dict[str, dict] = {}
 
 
 def _cache_url(platform: str, url: str) -> str:
@@ -63,6 +65,31 @@ def _cache_url(platform: str, url: str) -> str:
 def _get_cached_url(key: str):
     """Ambil (platform, url) dari cache berdasarkan short key."""
     return _url_cache.get(key)
+
+
+def _cache_slideshow(data: dict) -> str:
+    """Simpan slideshow data, return short key."""
+    key = hashlib.md5(str(time.time()).encode()).hexdigest()[:8]
+    _slideshow_cache[key] = data
+    # Cleanup lama
+    if len(_slideshow_cache) > 100:
+        for old_key in list(_slideshow_cache.keys())[:50]:
+            old = _slideshow_cache.pop(old_key, None)
+            if old:
+                _cleanup_slideshow_files(old)
+    return key
+
+
+def _get_slideshow(key: str):
+    return _slideshow_cache.get(key)
+
+
+def _cleanup_slideshow_files(data: dict):
+    """Hapus file temporary slideshow."""
+    for p in data.get("paths", []):
+        Path(p).unlink(missing_ok=True)
+    if data.get("audio_path"):
+        Path(data["audio_path"]).unlink(missing_ok=True)
 
 
 # ===== URL PATTERNS =====
@@ -241,36 +268,41 @@ async def download_tiktok(url: str, audio_only: bool = False, progress_hook=None
                         logger.error(f"Download image {i} error: {e}")
 
                 if downloaded:
+                    # Download audio untuk photo slideshow
+                    audio_path = None
+                    audio_url = video_data.get("play") or video_data.get("hdplay")
+                    if audio_url:
+                        if not audio_url.startswith("http"):
+                            audio_url = "https://www.tikwm.com" + audio_url
+                        try:
+                            async with httpx.AsyncClient(timeout=120, follow_redirects=True) as client:
+                                aresp = await client.get(audio_url)
+                                if aresp.status_code == 200:
+                                    tmp_a = DOWNLOAD_DIR / f"tmp_paudio_{hash(url) & 0xFFFFFFFF:08x}.mp4"
+                                    tmp_a.write_bytes(aresp.content)
+                                    mp3 = DOWNLOAD_DIR / f"tiktok_paudio_{hash(url) & 0xFFFFFFFF:08x}.mp3"
+                                    ok = await convert_to_mp3(str(tmp_a), str(mp3))
+                                    tmp_a.unlink(missing_ok=True)
+                                    if ok and mp3.exists():
+                                        audio_path = str(mp3)
+                        except Exception as e:
+                            logger.error(f"Photo audio download error: {e}")
+
                     result = {
                         "success": True, "type": "photos",
                         "paths": downloaded,
+                        "audio_path": audio_path,
                         "title": title, "author": author,
                         "size": sum(Path(p).stat().st_size for p in downloaded),
                         "duration": duration,
                     }
-                    # Audio-only: extract musik dari slideshow
-                    if audio_only:
-                        audio_url = video_data.get("play") or video_data.get("hdplay")
-                        if audio_url:
-                            if not audio_url.startswith("http"):
-                                audio_url = "https://www.tikwm.com" + audio_url
-                            try:
-                                async with httpx.AsyncClient(timeout=120, follow_redirects=True) as client:
-                                    aresp = await client.get(audio_url)
-                                    if aresp.status_code == 200:
-                                        tmp = DOWNLOAD_DIR / f"tmp_photo_audio_{hash(url) & 0xFFFFFFFF:08x}.mp4"
-                                        tmp.write_bytes(aresp.content)
-                                        mp3 = DOWNLOAD_DIR / f"tiktok_audio_{hash(url) & 0xFFFFFFFF:08x}.mp3"
-                                        ok = await convert_to_mp3(str(tmp), str(mp3))
-                                        tmp.unlink(missing_ok=True)
-                                        if ok and mp3.exists():
-                                            return {
-                                                "success": True, "path": str(mp3), "type": "audio",
-                                                "title": title, "author": author,
-                                                "size": mp3.stat().st_size, "duration": duration,
-                                            }
-                            except Exception as e:
-                                logger.error(f"Photo audio extract error: {e}")
+                    # Audio-only mode
+                    if audio_only and audio_path:
+                        return {
+                            "success": True, "path": audio_path, "type": "audio",
+                            "title": title, "author": author,
+                            "size": Path(audio_path).stat().st_size, "duration": duration,
+                        }
                     return result
 
             # === VIDEO POST ===
@@ -395,6 +427,57 @@ async def convert_to_mp3(input_path: str, output_path: str) -> bool:
         return Path(output_path).exists()
     except Exception as e:
         logger.error(f"Convert error: {e}")
+        return False
+
+
+async def photos_to_video(image_paths: list, audio_path: str, output_path: str,
+                          duration_per_image: float = 3.0) -> bool:
+    """Gabungkan foto + audio jadi video slideshow."""
+    try:
+        import subprocess
+
+        # Buat file list untuk ffmpeg concat
+        list_file = DOWNLOAD_DIR / f"concat_{hash(output_path) & 0xFFFFFFFF:08x}.txt"
+        with open(list_file, 'w') as f:
+            for img in image_paths:
+                f.write(f"file '{img}'\n")
+                f.write(f"duration {duration_per_image}\n")
+            # Repeat last image supaya transisi halus
+            f.write(f"file '{image_paths[-1]}'\n")
+
+        # Hitung total durasi audio
+        probe_cmd = [
+            'ffprobe', '-v', 'quiet', '-show_entries', 'format=duration',
+            '-of', 'csv=p=0', audio_path
+        ]
+        probe = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=10)
+        audio_dur = float(probe.stdout.strip()) if probe.stdout.strip() else 30.0
+
+        # Sesuaikan durasi per gambar supaya total = audio duration
+        dur_per = audio_dur / len(image_paths)
+        with open(list_file, 'w') as f:
+            for img in image_paths:
+                f.write(f"file '{img}'\n")
+                f.write(f"duration {dur_per:.2f}\n")
+            f.write(f"file '{image_paths[-1]}'\n")
+
+        # Buat slideshow video dari gambar
+        proc = await asyncio.create_subprocess_exec(
+            'ffmpeg', '-f', 'concat', '-safe', '0', '-i', str(list_file),
+            '-i', audio_path,
+            '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
+            '-vf', 'scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2',
+            '-c:a', 'aac', '-b:a', '192k',
+            '-shortest', '-y', output_path,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL
+        )
+        await proc.wait()
+
+        list_file.unlink(missing_ok=True)
+        return Path(output_path).exists() and Path(output_path).stat().st_size > 0
+    except Exception as e:
+        logger.error(f"Photos to video error: {e}")
         return False
 
 
@@ -680,31 +763,32 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             # Kirim media
             if result.get("type") == "photos":
-                # TikTok photo slideshow — kirim sebagai media group
-                paths = result["paths"]
+                # TikTok photo slideshow — tampilkan 3 opsi
+                slide_key = _cache_slideshow({
+                    "paths": result["paths"],
+                    "audio_path": result.get("audio_path"),
+                    "title": result["title"],
+                    "author": result["author"],
+                    "size": result["size"],
+                })
                 caption = safe_caption(emoji, result["title"], result["author"], info_text)
-                media_group = []
-                opened_files = []  # track open files untuk di-close nanti
-                for i, p in enumerate(paths):
-                    img_path = Path(p)
-                    if img_path.exists():
-                        f = open(img_path, 'rb')
-                        opened_files.append(f)
-                        cap = caption if i == 0 else ""
-                        media_group.append(InputMediaPhoto(media=f, caption=cap))
-                if media_group:
-                    await update.message.reply_media_group(media=media_group)
-                for f in opened_files:
-                    f.close()
-                # Cleanup foto
-                for p in paths:
-                    Path(p).unlink(missing_ok=True)
-                # Kirim tombol audio terpisah (reply_media_group tidak support reply_markup)
-                if keyboard:
-                    await update.message.reply_text(
-                        "🎵 Download musik/slideshow audio:",
-                        reply_markup=keyboard
-                    )
+                # Kirim preview foto pertama + 3 tombol opsi
+                first_photo = Path(result["paths"][0]) if result["paths"] else None
+                slide_kb = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🎬 Gabung jadi Video", callback_data=f"sv|{slide_key}")],
+                    [
+                        InlineKeyboardButton("📸 Foto Only", callback_data=f"sp|{slide_key}"),
+                        InlineKeyboardButton("🎵 Audio Only", callback_data=f"sa|{slide_key}"),
+                    ],
+                ])
+                if first_photo and first_photo.exists():
+                    with open(first_photo, 'rb') as f:
+                        await update.message.reply_photo(
+                            photo=f, caption=caption,
+                            reply_markup=slide_kb
+                        )
+                else:
+                    await update.message.reply_text(caption, reply_markup=slide_kb)
 
             elif result.get("type") == "photo":
                 file_path = Path(result["path"])
@@ -738,10 +822,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_audio_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handler tombol 'Download Audio' dari inline keyboard."""
+    """Handler tombol 'Download Audio' dari inline keyboard (video posts)."""
     query = update.callback_query
-
-    # Parse callback data
     data = query.data or ""
     parts = data.split("|", 1)
     if len(parts) != 2 or parts[0] != "a":
@@ -754,7 +836,6 @@ async def handle_audio_callback(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     platform, url = cached
-
     await query.answer("🎵 Memproses audio...")
     status_msg = await query.message.reply_text(f"🎵 Extract audio dari {platform.title()}...")
 
@@ -796,6 +877,96 @@ async def handle_audio_callback(update: Update, context: ContextTypes.DEFAULT_TY
         await status_msg.edit_text(f"❌ Error: {str(e)[:200]}")
 
 
+async def handle_slideshow_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handler tombol slideshow: sv=video, sp=photos, sa=audio"""
+    query = update.callback_query
+    data = query.data or ""
+    parts = data.split("|", 1)
+    if len(parts) != 2:
+        await query.answer("Data tidak valid.", show_alert=True)
+        return
+
+    action, slide_key = parts
+    slide = _get_slideshow(slide_key)
+    if not slide:
+        await query.answer("Data expired. Kirim ulang link-nya ya.", show_alert=True)
+        return
+
+    paths = slide["paths"]
+    audio_path = slide.get("audio_path")
+    title = slide.get("title", "TikTok Slideshow")
+    author = slide.get("author", "unknown")
+
+    # === FOTO ONLY ===
+    if action == "sp":
+        await query.answer("📸 Mengirim foto...")
+        media_group = []
+        opened = []
+        for i, p in enumerate(paths):
+            img = Path(p)
+            if img.exists():
+                f = open(img, 'rb')
+                opened.append(f)
+                cap = safe_caption("📸", title, author) if i == 0 else ""
+                media_group.append(InputMediaPhoto(media=f, caption=cap))
+        if media_group:
+            await query.message.reply_media_group(media=media_group)
+        for f in opened:
+            f.close()
+        _cleanup_slideshow_files(slide)
+        _slideshow_cache.pop(slide_key, None)
+
+    # === AUDIO ONLY ===
+    elif action == "sa":
+        if not audio_path or not Path(audio_path).exists():
+            await query.answer("Audio tidak tersedia.", show_alert=True)
+            return
+        await query.answer("🎵 Mengirim audio...")
+        caption = safe_caption("🎵", title, author, f"📦 {format_size(Path(audio_path).stat().st_size)}")
+        with open(audio_path, 'rb') as f:
+            await query.message.reply_audio(
+                audio=f, caption=caption,
+                title=title, performer=author
+            )
+        _cleanup_slideshow_files(slide)
+        _slideshow_cache.pop(slide_key, None)
+
+    # === GABUNG JADI VIDEO ===
+    elif action == "sv":
+        if not audio_path or not Path(audio_path).exists():
+            await query.answer("Audio tidak tersedia untuk digabung.", show_alert=True)
+            return
+        await query.answer("🎬 Membuat video...")
+        status_msg = await query.message.reply_text("🎬 Menggabungkan foto + audio jadi video...")
+
+        video_path = str(DOWNLOAD_DIR / f"slideshow_{slide_key}.mp4")
+        success = await photos_to_video(paths, audio_path, video_path)
+
+        if success:
+            vid_file = Path(video_path)
+            if vid_file.stat().st_size > MAX_FILE_SIZE:
+                await status_msg.edit_text(
+                    f"❌ Video terlalu besar ({format_size(vid_file.stat().st_size)}). Limit 50MB."
+                )
+                vid_file.unlink(missing_ok=True)
+            else:
+                caption = safe_caption("🎬", title, author,
+                                       f"📦 {format_size(vid_file.stat().st_size)}")
+                await safe_edit_msg(context.bot, update.effective_chat.id,
+                                    status_msg.message_id, "🎬 Mengirim video...")
+                with open(vid_file, 'rb') as f:
+                    await query.message.reply_video(
+                        video=f, caption=caption, supports_streaming=True
+                    )
+                await status_msg.delete()
+                vid_file.unlink(missing_ok=True)
+        else:
+            await status_msg.edit_text("❌ Gagal membuat video.")
+
+        _cleanup_slideshow_files(slide)
+        _slideshow_cache.pop(slide_key, None)
+
+
 async def safe_edit_msg(bot, chat_id: int, msg_id: int, text: str):
     """Edit message dengan error handling."""
     try:
@@ -826,8 +997,10 @@ def main():
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("audio", audio_cmd))
 
-    # Callback handler untuk tombol audio
+    # Callback handler untuk tombol audio (video posts)
     app.add_handler(CallbackQueryHandler(handle_audio_callback, pattern=r"^a\|"))
+    # Callback handler untuk slideshow (photo posts)
+    app.add_handler(CallbackQueryHandler(handle_slideshow_callback, pattern=r"^s[vpa]\|"))
 
     # Message handler (harus terakhir, paling rendah priority)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
