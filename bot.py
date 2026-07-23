@@ -19,7 +19,7 @@ import time
 from pathlib import Path
 from functools import partial
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     CallbackQueryHandler, filters, ContextTypes
@@ -205,7 +205,7 @@ class ProgressTracker:
 # ===== DOWNLOAD FUNCTIONS =====
 
 async def download_tiktok(url: str, audio_only: bool = False, progress_hook=None) -> dict:
-    """Download TikTok video/audio tanpa watermark."""
+    """Download TikTok video/audio/photo tanpa watermark."""
     try:
         api_url = "https://www.tikwm.com/api/"
         params = {"url": url, "hd": 1}
@@ -216,8 +216,65 @@ async def download_tiktok(url: str, audio_only: bool = False, progress_hook=None
 
         if data.get("code") == 0 and data.get("data"):
             video_data = data["data"]
-            video_url = video_data.get("hdplay") or video_data.get("play")
+            author = video_data.get("author", {}).get("unique_id", "unknown")
+            title = video_data.get("title", "TikTok")[:120]
+            duration = video_data.get("duration")
 
+            # === PHOTO POST (slideshow) ===
+            images = video_data.get("images")
+            if images and isinstance(images, list) and len(images) > 0:
+                logger.info(f"TikTok photo post detected: {len(images)} images")
+                downloaded = []
+                for i, img_url in enumerate(images[:10]):  # max 10 foto
+                    if not isinstance(img_url, str):
+                        continue
+                    if not img_url.startswith("http"):
+                        img_url = "https://www.tikwm.com" + img_url
+                    try:
+                        async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
+                            img_resp = await client.get(img_url)
+                            if img_resp.status_code == 200:
+                                img_path = DOWNLOAD_DIR / f"tiktok_photo_{hash(url) & 0xFFFFFFFF:08x}_{i}.jpg"
+                                img_path.write_bytes(img_resp.content)
+                                downloaded.append(str(img_path))
+                    except Exception as e:
+                        logger.error(f"Download image {i} error: {e}")
+
+                if downloaded:
+                    result = {
+                        "success": True, "type": "photos",
+                        "paths": downloaded,
+                        "title": title, "author": author,
+                        "size": sum(Path(p).stat().st_size for p in downloaded),
+                        "duration": duration,
+                    }
+                    # Audio-only: extract musik dari slideshow
+                    if audio_only:
+                        audio_url = video_data.get("play") or video_data.get("hdplay")
+                        if audio_url:
+                            if not audio_url.startswith("http"):
+                                audio_url = "https://www.tikwm.com" + audio_url
+                            try:
+                                async with httpx.AsyncClient(timeout=120, follow_redirects=True) as client:
+                                    aresp = await client.get(audio_url)
+                                    if aresp.status_code == 200:
+                                        tmp = DOWNLOAD_DIR / f"tmp_photo_audio_{hash(url) & 0xFFFFFFFF:08x}.mp4"
+                                        tmp.write_bytes(aresp.content)
+                                        mp3 = DOWNLOAD_DIR / f"tiktok_audio_{hash(url) & 0xFFFFFFFF:08x}.mp3"
+                                        ok = await convert_to_mp3(str(tmp), str(mp3))
+                                        tmp.unlink(missing_ok=True)
+                                        if ok and mp3.exists():
+                                            return {
+                                                "success": True, "path": str(mp3), "type": "audio",
+                                                "title": title, "author": author,
+                                                "size": mp3.stat().st_size, "duration": duration,
+                                            }
+                            except Exception as e:
+                                logger.error(f"Photo audio extract error: {e}")
+                    return result
+
+            # === VIDEO POST ===
+            video_url = video_data.get("hdplay") or video_data.get("play")
             if video_url:
                 if not video_url.startswith("http"):
                     video_url = "https://www.tikwm.com" + video_url
@@ -236,24 +293,20 @@ async def download_tiktok(url: str, audio_only: bool = False, progress_hook=None
                             if success and mp3_path.exists():
                                 return {
                                     "success": True, "path": str(mp3_path), "type": "audio",
-                                    "title": video_data.get("title", "TikTok Audio")[:120],
-                                    "author": video_data.get("author", {}).get("unique_id", "unknown"),
-                                    "size": mp3_path.stat().st_size,
-                                    "duration": video_data.get("duration"),
+                                    "title": title, "author": author,
+                                    "size": mp3_path.stat().st_size, "duration": duration,
                                 }
                         else:
                             file_path = DOWNLOAD_DIR / f"tiktok_{hash(url) & 0xFFFFFFFF:08x}.mp4"
                             file_path.write_bytes(content)
                             return {
                                 "success": True, "path": str(file_path), "type": "video",
-                                "title": video_data.get("title", "TikTok Video")[:120],
-                                "author": video_data.get("author", {}).get("unique_id", "unknown"),
-                                "size": len(content),
-                                "duration": video_data.get("duration"),
+                                "title": title, "author": author,
+                                "size": len(content), "duration": duration,
                             }
 
         # Fallback ke yt-dlp
-        return await download_with_ytdlp(url, "tiktok", audio_only, progress_hook if 'progress_hook' in dir() else None)
+        return await download_with_ytdlp(url, "tiktok", audio_only, progress_hook)
 
     except Exception as e:
         logger.error(f"TikTok error: {e}")
@@ -602,11 +655,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         if result["success"]:
-            file_path = Path(result["path"])
             file_size = result["size"]
 
-            # Cek limit Telegram
-            if file_size > MAX_FILE_SIZE:
+            # Cek limit Telegram (untuk single file)
+            if file_size > MAX_FILE_SIZE and result.get("type") != "photos":
                 await status_msg.edit_text(
                     f"❌ File terlalu besar ({format_size(file_size)}). "
                     f"Limit Telegram 50MB."
@@ -617,9 +669,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             info_text = build_info_text(result, file_size)
             caption = safe_caption(emoji, result["title"], result["author"], info_text)
 
-            # Tombol download audio (jika video punya audio)
+            # Tombol download audio (jika video/photo punya audio)
             keyboard = None
-            if result.get("type") == "video":
+            if result.get("type") in ("video", "photos"):
                 cache_key = _cache_url(platform, url)
                 cb_data = f"a|{cache_key}"  # short! fits in 64 bytes
                 keyboard = InlineKeyboardMarkup([[
@@ -627,21 +679,51 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ]])
 
             # Kirim media
-            if result.get("type") == "photo":
+            if result.get("type") == "photos":
+                # TikTok photo slideshow — kirim sebagai media group
+                paths = result["paths"]
+                caption = safe_caption(emoji, result["title"], result["author"], info_text)
+                media_group = []
+                opened_files = []  # track open files untuk di-close nanti
+                for i, p in enumerate(paths):
+                    img_path = Path(p)
+                    if img_path.exists():
+                        f = open(img_path, 'rb')
+                        opened_files.append(f)
+                        cap = caption if i == 0 else ""
+                        media_group.append(InputMediaPhoto(media=f, caption=cap))
+                if media_group:
+                    await update.message.reply_media_group(media=media_group)
+                for f in opened_files:
+                    f.close()
+                # Cleanup foto
+                for p in paths:
+                    Path(p).unlink(missing_ok=True)
+                # Kirim tombol audio terpisah (reply_media_group tidak support reply_markup)
+                if keyboard:
+                    await update.message.reply_text(
+                        "🎵 Download musik/slideshow audio:",
+                        reply_markup=keyboard
+                    )
+
+            elif result.get("type") == "photo":
+                file_path = Path(result["path"])
                 with open(file_path, 'rb') as f:
                     await update.message.reply_photo(
                         photo=f, caption=caption
                     )
+                file_path.unlink(missing_ok=True)
             else:
+                file_path = Path(result["path"])
                 with open(file_path, 'rb') as f:
                     await update.message.reply_video(
                         video=f, caption=caption,
                         supports_streaming=True,
                         reply_markup=keyboard
                     )
+                file_path.unlink(missing_ok=True)
 
             await status_msg.delete()
-            file_path.unlink(missing_ok=True)
 
         else:
             await status_msg.edit_text(
