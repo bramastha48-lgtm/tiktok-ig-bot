@@ -204,7 +204,7 @@ class ProgressTracker:
 
 # ===== DOWNLOAD FUNCTIONS =====
 
-async def download_tiktok(url: str, audio_only: bool = False) -> dict:
+async def download_tiktok(url: str, audio_only: bool = False, progress_hook=None) -> dict:
     """Download TikTok video/audio tanpa watermark."""
     try:
         api_url = "https://www.tikwm.com/api/"
@@ -253,7 +253,7 @@ async def download_tiktok(url: str, audio_only: bool = False) -> dict:
                             }
 
         # Fallback ke yt-dlp
-        return await download_with_ytdlp(url, "tiktok", audio_only)
+        return await download_with_ytdlp(url, "tiktok", audio_only, progress_hook if 'progress_hook' in dir() else None)
 
     except Exception as e:
         logger.error(f"TikTok error: {e}")
@@ -351,17 +351,26 @@ async def download_with_ytdlp(
 ) -> dict:
     """Download menggunakan yt-dlp."""
     ext = "mp3" if audio_only else "mp4"
-    file_path = DOWNLOAD_DIR / f"{platform}_{hash(url) & 0xFFFFFFFF:08x}.{ext}"
+    # Pakai unique suffix supaya tidak match file lama
+    unique = f"{hash(url) & 0xFFFFFFFF:08x}_{int(time.time())}"
+    file_path = DOWNLOAD_DIR / f"{platform}_{unique}.{ext}"
+
+    if audio_only:
+        fmt = 'bestaudio/best'
+    else:
+        # HARUS ada video: pilih format yang punya video stream
+        # bestvideo+bestaudio > best[ext=mp4] > best (yang bisa audio-only)
+        fmt = 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best[ext=mp4]/best'
 
     ydl_opts = {
-        'format': 'bestaudio/best' if audio_only else 'best[ext=mp4]/best',
+        'format': fmt,
         'outtmpl': str(file_path),
         'quiet': True,
         'no_warnings': True,
         'socket_timeout': 30,
         'retries': 3,
         'merge_output_format': 'mp4',
-        'noplaylist': True,  # jangan download playlist
+        'noplaylist': True,
     }
 
     if audio_only:
@@ -388,17 +397,26 @@ async def download_with_ytdlp_opts(url: str, opts: dict, platform: str) -> dict:
         loop = asyncio.get_event_loop()
         info = await loop.run_in_executor(None, _run_ytdlp, url, opts)
 
-        # Cari file yang didownload
+        # Cari file yang didownload — cari paling baru
+        target_file = None
+        target_mtime = 0
         for f in DOWNLOAD_DIR.glob(f"{platform}_*"):
             if f.exists() and f.stat().st_size > 0:
-                file_type = "audio" if f.suffix.lower() == ".mp3" else "video"
-                return {
-                    "success": True, "path": str(f), "type": file_type,
-                    "title": info.get("title", f"{platform.title()} Media")[:120],
-                    "author": info.get("uploader", "unknown"),
-                    "size": f.stat().st_size,
-                    "duration": info.get("duration"),
-                }
+                mt = f.stat().st_mtime
+                if mt > target_mtime:
+                    target_mtime = mt
+                    target_file = f
+
+        if target_file:
+            # Deteksi tipe berdasarkan isi file, bukan cuma ekstensi
+            file_type = _detect_file_type(target_file)
+            return {
+                "success": True, "path": str(target_file), "type": file_type,
+                "title": info.get("title", f"{platform.title()} Media")[:120],
+                "author": info.get("uploader", "unknown"),
+                "size": target_file.stat().st_size,
+                "duration": info.get("duration"),
+            }
 
         return {"success": False, "error": "File tidak ditemukan setelah download"}
     except Exception as e:
@@ -410,6 +428,31 @@ def _run_ytdlp(url: str, opts: dict) -> dict:
     """Blocking yt-dlp call (jalan di thread pool)."""
     with yt_dlp.YoutubeDL(opts) as ydl:
         return ydl.extract_info(url, download=True)
+
+
+def _detect_file_type(file_path: Path) -> str:
+    """Deteksi apakah file berisi video atau audio-only."""
+    suffix = file_path.suffix.lower()
+    if suffix == '.mp3':
+        return "audio"
+    if suffix in ('.jpg', '.jpeg', '.png', '.webp'):
+        return "photo"
+    # Untuk .mp4/.webm/.mkv, cek apakah ada video stream
+    try:
+        import subprocess
+        result = subprocess.run(
+            ['ffprobe', '-v', 'quiet', '-select_streams', 'v:0',
+             '-show_entries', 'stream=codec_type',
+             '-of', 'csv=p=0', str(file_path)],
+            capture_output=True, text=True, timeout=5
+        )
+        if 'video' in result.stdout:
+            return "video"
+        else:
+            return "audio"  # mp4 container tapi isinya audio-only
+    except Exception:
+        # ffprobe tidak ada? fallback ke ekstensi
+        return "video" if suffix in ('.mp4', '.webm', '.mkv', '.avi') else "audio"
 
 
 # ===== DOWNLOAD ORCHESTRATOR =====
@@ -430,12 +473,7 @@ async def do_download(url: str, platform: str, audio_only: bool,
         progress_hook = tracker.hook
 
     if platform == 'tiktok':
-        if audio_only:
-            return await download_tiktok(url, audio_only=True)
-        else:
-            result = await download_tiktok(url, audio_only=False)
-            # TikTok API tidak support progress, tapi yt-dlp fallback bisa
-            return result
+        return await download_tiktok(url, audio_only=audio_only, progress_hook=progress_hook)
     elif platform == 'instagram':
         return await download_instagram(url)
     else:
