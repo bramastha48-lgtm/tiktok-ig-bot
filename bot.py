@@ -2,10 +2,12 @@
 Telegram Bot: Universal Video Downloader (No Watermark)
 Support: TikTok, Instagram, YouTube Shorts, Twitter/X, Pinterest
 
-Cara pakai:
-  1. pip install -r requirements.txt
-  2. Set BOT_TOKEN di environment variable
-  3. python bot.py
+Fitur:
+  - Auto detect link → download video + kirim info file
+  - Tombol "Download Audio" di bawah video
+  - /audio universal (semua platform)
+  - Progress download real-time
+  - Support Instagram photo/carousel
 """
 
 import os
@@ -13,34 +15,91 @@ import re
 import asyncio
 import tempfile
 import logging
+import time
 from pathlib import Path
+from functools import partial
 
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler,
+    CallbackQueryHandler, filters, ContextTypes
+)
+from telegram.error import BadRequest
 import yt_dlp
 import httpx
+import hashlib
 
 # Logging
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
 logger = logging.getLogger(__name__)
 
 # Config
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 DOWNLOAD_DIR = Path(tempfile.mkdtemp(prefix="vidl_"))
 MAX_FILE_SIZE = 50 * 1024 * 1024  # Telegram limit 50MB
+PROGRESS_INTERVAL = 2  # detik antara update progress
+
+# Cache URL untuk callback (Telegram callback_data limit = 64 bytes)
+# key = short_hash, value = (platform, url)
+_url_cache: dict[str, tuple[str, str]] = {}
+
+
+def _cache_url(platform: str, url: str) -> str:
+    """Simpan URL di cache, return short key untuk callback_data."""
+    # Pakai 8 char dari hash — cukup unik untuk bot kecil
+    key = hashlib.md5(url.encode()).hexdigest()[:8]
+    _url_cache[key] = (platform, url)
+    # Bersihkan cache jika terlalu besar (>1000 entry)
+    if len(_url_cache) > 1000:
+        # Hapus entry tertua (FIFO-ish)
+        for old_key in list(_url_cache.keys())[:500]:
+            _url_cache.pop(old_key, None)
+    return key
+
+
+def _get_cached_url(key: str):
+    """Ambil (platform, url) dari cache berdasarkan short key."""
+    return _url_cache.get(key)
+
 
 # ===== URL PATTERNS =====
 PATTERNS = {
-    'tiktok': re.compile(r'https?://(?:www\.)?(?:tiktok\.com|vm\.tiktok\.com|vt\.tiktok\.com|t\.tiktok\.com)/[^\s]+', re.I),
-    'instagram': re.compile(r'https?://(?:www\.)?(?:instagram\.com|instagr\.am)/(?:reel|p|tv|stories)/[^\s]+', re.I),
-    'youtube': re.compile(r'https?://(?:www\.)?(?:youtube\.com/shorts/|youtu\.be/|youtube\.com/watch\?v=)[^\s]+', re.I),
-    'twitter': re.compile(r'https?://(?:www\.)?(?:twitter\.com|x\.com)/\w+/status/\d+[^\s]*', re.I),
-    'pinterest': re.compile(r'https?://(?:www\.)?(?:pinterest\.com|pin\.it)/[^\s]+', re.I),
+    'tiktok': re.compile(
+        r'https?://(?:www\.)?(?:tiktok\.com|vm\.tiktok\.com|vt\.tiktok\.com|t\.tiktok\.com)/[^\s]+',
+        re.I
+    ),
+    'instagram': re.compile(
+        r'https?://(?:www\.)?(?:instagram\.com|instagr\.am)/(?:reel|p|tv|stories)/[^\s]+',
+        re.I
+    ),
+    'youtube': re.compile(
+        r'https?://(?:www\.)?(?:youtube\.com/shorts/|youtu\.be/|youtube\.com/watch\?v=)[^\s]+',
+        re.I
+    ),
+    'twitter': re.compile(
+        r'https?://(?:www\.)?(?:twitter\.com|x\.com)/\w+/status/\d+[^\s]*',
+        re.I
+    ),
+    'pinterest': re.compile(
+        r'https?://(?:www\.)?(?:pinterest\.com|pin\.it)/[^\s]+',
+        re.I
+    ),
+}
+
+# Emoji per platform
+EMOJIS = {
+    'tiktok': '🎵', 'instagram': '📸', 'youtube': '▶️',
+    'twitter': '🐦', 'pinterest': '📌'
 }
 
 
-def detect_url(text: str) -> tuple:
-    """Deteksi platform dan URL dari text"""
+def detect_url(text: str):
+    """Deteksi platform dan URL dari text. Return (platform, url) atau (None, None)."""
+    if not text:
+        return (None, None)
     for platform, pattern in PATTERNS.items():
         match = pattern.search(text)
         if match:
@@ -48,12 +107,106 @@ def detect_url(text: str) -> tuple:
     return (None, None)
 
 
+def safe_caption(emoji: str, title: str, author: str, extra_info: str = "") -> str:
+    """Buat caption plain text — aman dari Markdown parse error."""
+    clean_title = (title or "Media").strip()[:120]
+    clean_author = (author or "unknown").strip()
+    caption = f"{emoji} {clean_title}\n👤 @{clean_author}"
+    if extra_info:
+        caption += f"\n{extra_info}"
+    return caption
+
+
+def format_size(size_bytes: int) -> str:
+    """Format bytes ke human-readable string."""
+    if size_bytes < 1024:
+        return f"{size_bytes}B"
+    elif size_bytes < 1024 * 1024:
+        return f"{size_bytes / 1024:.1f}KB"
+    else:
+        return f"{size_bytes / (1024 * 1024):.1f}MB"
+
+
+def format_duration(seconds: float) -> str:
+    """Format detik ke MM:SS."""
+    if not seconds:
+        return ""
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"0:{seconds:02d}"
+    else:
+        return f"{seconds // 60}:{seconds % 60:02d}"
+
+
+def build_info_text(info: dict, file_size: int) -> str:
+    """Bangun string info file dari metadata yt-dlp."""
+    parts = []
+    dur = info.get("duration")
+    if dur:
+        parts.append(f"⏱️ {format_duration(dur)}")
+    parts.append(f"📦 {format_size(file_size)}")
+    res = info.get("resolution") or info.get("format_note", "")
+    if res:
+        parts.append(f"🖥️ {res}")
+    return " | ".join(parts)
+
+
+# ===== PROGRESS TRACKER =====
+
+class ProgressTracker:
+    """Track download progress dan update Telegram message."""
+
+    def __init__(self, bot, chat_id: int, status_msg_id: int, emoji: str, platform: str):
+        self.bot = bot
+        self.chat_id = chat_id
+        self.status_msg_id = status_msg_id
+        self.emoji = emoji
+        self.platform = platform
+        self.last_update = 0.0
+        self._loop = asyncio.get_event_loop()
+
+    def hook(self, d: dict):
+        """yt-dlp progress hook — dipanggil dari thread, jadi pakai run_coroutine_threadsafe."""
+        if d['status'] != 'downloading':
+            return
+
+        now = time.time()
+        if now - self.last_update < PROGRESS_INTERVAL:
+            return
+        self.last_update = now
+
+        percent_str = d.get('_percent_str', '0%').strip()
+        speed = d.get('_speed_str', '').strip()
+        eta = d.get('_eta_str', '').strip()
+
+        text = f"{self.emoji} Mendownload dari {self.platform.title()}...\n"
+        text += f"📊 {percent_str}"
+        if speed:
+            text += f" | {speed}"
+        if eta:
+            text += f" | ETA {eta}"
+
+        asyncio.run_coroutine_threadsafe(
+            self._safe_edit(text), self._loop
+        )
+
+    async def _safe_edit(self, text: str):
+        """Edit message, ignore error jika gagal."""
+        try:
+            await self.bot.edit_message_text(
+                chat_id=self.chat_id,
+                message_id=self.status_msg_id,
+                text=text
+            )
+        except (BadRequest, Exception):
+            pass  # rate limit atau message not modified, abaikan
+
+
 # ===== DOWNLOAD FUNCTIONS =====
 
 async def download_tiktok(url: str, audio_only: bool = False) -> dict:
-    """Download TikTok video/audio tanpa watermark"""
+    """Download TikTok video/audio tanpa watermark."""
     try:
-        # Method 1: tikwm.com API
         api_url = "https://www.tikwm.com/api/"
         params = {"url": url, "hd": 1}
 
@@ -63,54 +216,43 @@ async def download_tiktok(url: str, audio_only: bool = False) -> dict:
 
         if data.get("code") == 0 and data.get("data"):
             video_data = data["data"]
+            video_url = video_data.get("hdplay") or video_data.get("play")
 
-            if audio_only:
-                # Download video lalu extract audio
-                video_url = video_data.get("hdplay") or video_data.get("play")
-                if video_url:
-                    if not video_url.startswith("http"):
-                        video_url = "https://www.tikwm.com" + video_url
+            if video_url:
+                if not video_url.startswith("http"):
+                    video_url = "https://www.tikwm.com" + video_url
 
-                    async with httpx.AsyncClient(timeout=120, follow_redirects=True) as client:
-                        vresp = await client.get(video_url)
-                        if vresp.status_code == 200:
-                            # Save video sementara
+                async with httpx.AsyncClient(timeout=120, follow_redirects=True) as client:
+                    vresp = await client.get(video_url)
+                    if vresp.status_code == 200:
+                        content = vresp.content
+
+                        if audio_only:
                             tmp_video = DOWNLOAD_DIR / f"tmp_{hash(url) & 0xFFFFFFFF:08x}.mp4"
-                            tmp_video.write_bytes(vresp.content)
-
-                            # Convert ke MP3
+                            tmp_video.write_bytes(content)
                             mp3_path = DOWNLOAD_DIR / f"tiktok_audio_{hash(url) & 0xFFFFFFFF:08x}.mp3"
                             success = await convert_to_mp3(str(tmp_video), str(mp3_path))
                             tmp_video.unlink(missing_ok=True)
-
                             if success and mp3_path.exists():
                                 return {
                                     "success": True, "path": str(mp3_path), "type": "audio",
-                                    "title": video_data.get("title", "TikTok Audio")[:100],
+                                    "title": video_data.get("title", "TikTok Audio")[:120],
                                     "author": video_data.get("author", {}).get("unique_id", "unknown"),
-                                    "size": mp3_path.stat().st_size
+                                    "size": mp3_path.stat().st_size,
+                                    "duration": video_data.get("duration"),
                                 }
-
-            else:
-                # Download video
-                video_url = video_data.get("hdplay") or video_data.get("play")
-                if video_url:
-                    if not video_url.startswith("http"):
-                        video_url = "https://www.tikwm.com" + video_url
-
-                    async with httpx.AsyncClient(timeout=120, follow_redirects=True) as client:
-                        vresp = await client.get(video_url)
-                        if vresp.status_code == 200:
+                        else:
                             file_path = DOWNLOAD_DIR / f"tiktok_{hash(url) & 0xFFFFFFFF:08x}.mp4"
-                            file_path.write_bytes(vresp.content)
+                            file_path.write_bytes(content)
                             return {
                                 "success": True, "path": str(file_path), "type": "video",
-                                "title": video_data.get("title", "TikTok Video")[:100],
+                                "title": video_data.get("title", "TikTok Video")[:120],
                                 "author": video_data.get("author", {}).get("unique_id", "unknown"),
-                                "size": len(vresp.content)
+                                "size": len(content),
+                                "duration": video_data.get("duration"),
                             }
 
-        # Fallback: yt-dlp
+        # Fallback ke yt-dlp
         return await download_with_ytdlp(url, "tiktok", audio_only)
 
     except Exception as e:
@@ -119,22 +261,17 @@ async def download_tiktok(url: str, audio_only: bool = False) -> dict:
 
 
 async def download_instagram(url: str) -> dict:
-    """Download Instagram (video + carousel photos)"""
+    """Download Instagram (video, reel, carousel photos)."""
     try:
-        # yt-dlp handles Instagram well
+        # Coba sebagai video/reel
         result = await download_with_ytdlp(url, "instagram", False)
 
-        # Jika gagal, coba tanpa login
+        # Jika "no video", coba sebagai gambar
         if not result["success"]:
-            ydl_opts = {
-                'format': 'best[ext=mp4]/best',
-                'outtmpl': str(DOWNLOAD_DIR / 'ig_%(id)s.%(ext)s'),
-                'quiet': True,
-                'no_warnings': True,
-                'socket_timeout': 30,
-                'retries': 3,
-            }
-            result = await download_with_ytdlp_opts(url, ydl_opts, "instagram")
+            err = result.get("error", "").lower()
+            if "no video" in err or "no media" in err:
+                logger.info("Instagram: no video, trying as image...")
+                result = await download_instagram_image(url)
 
         return result
     except Exception as e:
@@ -142,36 +279,59 @@ async def download_instagram(url: str) -> dict:
         return {"success": False, "error": str(e)[:200]}
 
 
-async def download_youtube(url: str) -> dict:
-    """Download YouTube Shorts"""
-    return await download_with_ytdlp(url, "youtube", False)
+async def download_instagram_image(url: str) -> dict:
+    """Download Instagram photo post sebagai gambar."""
+    try:
+        ydl_opts = {
+            'format': 'best',
+            'outtmpl': str(DOWNLOAD_DIR / 'ig_img_%(id)s.%(ext)s'),
+            'quiet': True,
+            'no_warnings': True,
+            'socket_timeout': 30,
+            'retries': 3,
+        }
+
+        loop = asyncio.get_event_loop()
+        info = await loop.run_in_executor(None, _run_ytdlp, url, ydl_opts)
+
+        # Cari file gambar
+        for ext in ['*.jpg', '*.jpeg', '*.png', '*.webp']:
+            for f in DOWNLOAD_DIR.glob(f"ig_img_{ext}"):
+                if f.exists() and f.stat().st_size > 0:
+                    return {
+                        "success": True, "path": str(f), "type": "photo",
+                        "title": info.get("title", "Instagram Photo")[:120],
+                        "author": info.get("uploader", "unknown"),
+                        "size": f.stat().st_size,
+                        "duration": None,
+                    }
+
+        # Cek semua file ig_img_*
+        for f in DOWNLOAD_DIR.glob("ig_img_*"):
+            if f.exists() and f.stat().st_size > 0:
+                file_type = "photo" if f.suffix.lower() in ('.jpg', '.jpeg', '.png', '.webp') else "video"
+                return {
+                    "success": True, "path": str(f), "type": file_type,
+                    "title": info.get("title", "Instagram Media")[:120],
+                    "author": info.get("uploader", "unknown"),
+                    "size": f.stat().st_size,
+                    "duration": info.get("duration"),
+                }
+
+        return {"success": False, "error": "Tidak bisa download media dari post ini"}
+    except Exception as e:
+        logger.error(f"Instagram image error: {e}")
+        return {"success": False, "error": str(e)[:200]}
 
 
-async def download_twitter(url: str) -> dict:
-    """Download Twitter/X video"""
-    return await download_with_ytdlp(url, "twitter", False)
-
-
-async def download_pinterest(url: str) -> dict:
-    """Download Pinterest video/foto"""
-    return await download_with_ytdlp(url, "pinterest", False)
+async def download_generic(url: str, platform: str, audio_only: bool = False) -> dict:
+    """Download dari platform lain via yt-dlp."""
+    return await download_with_ytdlp(url, platform, audio_only)
 
 
 async def convert_to_mp3(input_path: str, output_path: str) -> bool:
-    """Convert video ke MP3 menggunakan ffmpeg via yt-dlp"""
+    """Convert video/audio ke MP3 menggunakan ffmpeg."""
     try:
-        opts = {
-            'format': 'bestaudio/best',
-            'postprocessors': [{
-                'key': 'FFmpegExtractAudio',
-                'preferredcodec': 'mp3',
-                'preferredquality': '192',
-            }],
-            'outtmpl': output_path.replace('.mp3', ''),
-            'quiet': True,
-        }
-        # Jika file sudah ada, langsung convert
-        import subprocess
         proc = await asyncio.create_subprocess_exec(
             'ffmpeg', '-i', input_path, '-vn', '-ab', '192k',
             '-ar', '44100', '-y', output_path,
@@ -185,8 +345,11 @@ async def convert_to_mp3(input_path: str, output_path: str) -> bool:
         return False
 
 
-async def download_with_ytdlp(url: str, platform: str, audio_only: bool) -> dict:
-    """Download menggunakan yt-dlp"""
+async def download_with_ytdlp(
+    url: str, platform: str, audio_only: bool,
+    progress_hook=None
+) -> dict:
+    """Download menggunakan yt-dlp."""
     ext = "mp3" if audio_only else "mp4"
     file_path = DOWNLOAD_DIR / f"{platform}_{hash(url) & 0xFFFFFFFF:08x}.{ext}"
 
@@ -198,6 +361,7 @@ async def download_with_ytdlp(url: str, platform: str, audio_only: bool) -> dict
         'socket_timeout': 30,
         'retries': 3,
         'merge_output_format': 'mp4',
+        'noplaylist': True,  # jangan download playlist
     }
 
     if audio_only:
@@ -212,24 +376,28 @@ async def download_with_ytdlp(url: str, platform: str, audio_only: bool) -> dict
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         }
 
+    if progress_hook:
+        ydl_opts['progress_hooks'] = [progress_hook]
+
     return await download_with_ytdlp_opts(url, ydl_opts, platform)
 
 
 async def download_with_ytdlp_opts(url: str, opts: dict, platform: str) -> dict:
-    """Run yt-dlp dengan options"""
+    """Run yt-dlp dengan options."""
     try:
         loop = asyncio.get_event_loop()
         info = await loop.run_in_executor(None, _run_ytdlp, url, opts)
 
-        # Cari file yang di-download
+        # Cari file yang didownload
         for f in DOWNLOAD_DIR.glob(f"{platform}_*"):
             if f.exists() and f.stat().st_size > 0:
-                file_type = "audio" if f.suffix == ".mp3" else "video"
+                file_type = "audio" if f.suffix.lower() == ".mp3" else "video"
                 return {
                     "success": True, "path": str(f), "type": file_type,
-                    "title": info.get("title", f"{platform.title()} Media")[:100],
+                    "title": info.get("title", f"{platform.title()} Media")[:120],
                     "author": info.get("uploader", "unknown"),
-                    "size": f.stat().st_size
+                    "size": f.stat().st_size,
+                    "duration": info.get("duration"),
                 }
 
         return {"success": False, "error": "File tidak ditemukan setelah download"}
@@ -239,8 +407,39 @@ async def download_with_ytdlp_opts(url: str, opts: dict, platform: str) -> dict:
 
 
 def _run_ytdlp(url: str, opts: dict) -> dict:
+    """Blocking yt-dlp call (jalan di thread pool)."""
     with yt_dlp.YoutubeDL(opts) as ydl:
         return ydl.extract_info(url, download=True)
+
+
+# ===== DOWNLOAD ORCHESTRATOR =====
+
+async def do_download(url: str, platform: str, audio_only: bool,
+                      bot=None, chat_id: int = None,
+                      status_msg_id: int = None) -> dict:
+    """
+    Orchestrator: download dengan progress tracking.
+    Return dict result dari download function.
+    """
+    emoji = EMOJIS.get(platform, '🎬')
+
+    # Siapkan progress hook jika bot tersedia
+    progress_hook = None
+    if bot and chat_id and status_msg_id:
+        tracker = ProgressTracker(bot, chat_id, status_msg_id, emoji, platform)
+        progress_hook = tracker.hook
+
+    if platform == 'tiktok':
+        if audio_only:
+            return await download_tiktok(url, audio_only=True)
+        else:
+            result = await download_tiktok(url, audio_only=False)
+            # TikTok API tidak support progress, tapi yt-dlp fallback bisa
+            return result
+    elif platform == 'instagram':
+        return await download_instagram(url)
+    else:
+        return await download_with_ytdlp(url, platform, audio_only, progress_hook)
 
 
 # ===== TELEGRAM HANDLERS =====
@@ -250,12 +449,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🎬 *Universal Video Downloader Bot*\n\n"
         "Kirim link, saya download tanpa watermark!\n\n"
         "✅ TikTok (video & audio)\n"
-        "✅ Instagram (reel & carousel)\n"
+        "✅ Instagram (reel, carousel & foto)\n"
         "✅ YouTube Shorts\n"
         "✅ Twitter/X video\n"
         "✅ Pinterest video/foto\n\n"
         "📌 *Commands:*\n"
-        "• `/audio <link>` — download audio TikTok (MP3)\n"
+        "• `/audio <link>` — download audio dari platform manapun\n"
         "• `/help` — bantuan",
         parse_mode='Markdown'
     )
@@ -264,11 +463,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📖 *Cara Pakai:*\n\n"
-        "1️⃣ Copy link video\n"
+        "1️⃣ Copy link video/foto\n"
         "2️⃣ Kirim ke bot\n"
-        "3️⃣ Tunggu, media dikirim!\n\n"
-        "🎵 *Download Audio TikTok:*\n"
-        "`/audio https://vm.tiktok.com/xxx`\n\n"
+        "3️⃣ Tunggu proses, media dikirim!\n\n"
+        "🎵 *Download Audio:*\n"
+        "`/audio https://vm.tiktok.com/xxx`\n"
+        "Bisa dari TikTok, IG, YouTube, Twitter, dll.\n\n"
         "🔗 *Link yang didukung:*\n"
         "• TikTok: `tiktok.com/...` atau `vm.tiktok.com/...`\n"
         "• Instagram: `instagram.com/reel/...` atau `/p/...`\n"
@@ -280,90 +480,126 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def audio_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handler untuk /audio — download audio TikTok"""
+    """Handler /audio — universal audio download dari platform manapun."""
     if not context.args:
-        await update.message.reply_text("🎵 Gunakan: `/audio <link TikTok>`", parse_mode='Markdown')
+        await update.message.reply_text(
+            "🎵 Gunakan: `/audio <link>`\n\n"
+            "Support semua platform: TikTok, IG, YouTube, Twitter, Pinterest",
+            parse_mode='Markdown'
+        )
         return
 
-    url = context.args[0]
-    if 'tiktok' not in url and 'vm.tiktok' not in url:
-        await update.message.reply_text("❌ Hanya support link TikTok untuk audio.")
+    input_text = " ".join(context.args)
+    platform, url = detect_url(input_text)
+
+    if not platform:
+        await update.message.reply_text(
+            "❌ Link tidak dikenali.\n"
+            "Pastikan link valid dari TikTok, IG, YouTube, Twitter, atau Pinterest."
+        )
         return
 
-    status_msg = await update.message.reply_text("🎵 Sedang extract audio...")
+    emoji = EMOJIS.get(platform, '🎵')
+    status_msg = await update.message.reply_text(f"{emoji} Menyiapkan audio dari {platform.title()}...")
 
-    result = await download_tiktok(url, audio_only=True)
+    try:
+        result = await do_download(
+            url, platform, audio_only=True,
+            bot=context.bot, chat_id=update.effective_chat.id,
+            status_msg_id=status_msg.message_id
+        )
 
-    if result["success"]:
-        file_path = Path(result["path"])
-        caption = f"🎵 *{result['title']}*\n👤 @{result['author']}"
+        if result["success"]:
+            file_path = Path(result["path"])
 
-        with open(file_path, 'rb') as audio:
-            await update.message.reply_audio(
-                audio=audio, caption=caption, parse_mode='Markdown',
-                title=result["title"], performer=result["author"]
+            # Update progress selesai
+            await safe_edit_msg(
+                context.bot, update.effective_chat.id,
+                status_msg.message_id,
+                f"{emoji} Mengirim audio..."
             )
 
-        await status_msg.delete()
-        file_path.unlink(missing_ok=True)
-    else:
-        await status_msg.edit_text(f"❌ Gagal: {result.get('error', 'Unknown')}")
+            caption = safe_caption(emoji, result["title"], result["author"],
+                                   f"📦 {format_size(result['size'])}")
+
+            with open(file_path, 'rb') as f:
+                await update.message.reply_audio(
+                    audio=f, caption=caption,
+                    title=result.get("title", "Audio"),
+                    performer=result.get("author", "unknown")
+                )
+
+            await status_msg.delete()
+            file_path.unlink(missing_ok=True)
+        else:
+            await status_msg.edit_text(
+                f"❌ Gagal download audio.\n\n"
+                f"Error: {result.get('error', 'Unknown')[:200]}\n\n"
+                f"Pastikan link valid dan konten bersifat publik."
+            )
+
+    except Exception as e:
+        logger.error(f"Audio handler error: {e}")
+        await status_msg.edit_text(f"❌ Error: {str(e)[:200]}")
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handler utama — detect link dan download"""
+    """Handler utama — detect link dan download video."""
     text = update.message.text or ""
     platform, url = detect_url(text)
 
     if not platform:
         return
 
-    # Emoji per platform
-    emojis = {
-        'tiktok': '🎵', 'instagram': '📸', 'youtube': '▶️',
-        'twitter': '🐦', 'pinterest': '📌'
-    }
-    emoji = emojis.get(platform, '🎬')
-
-    status_msg = await update.message.reply_text(f"{emoji} Sedang mendownload dari {platform.title()}...")
+    emoji = EMOJIS.get(platform, '🎬')
+    status_msg = await update.message.reply_text(
+        f"{emoji} Mendownload dari {platform.title()}..."
+    )
 
     try:
-        if platform == 'tiktok':
-            result = await download_tiktok(url, audio_only=False)
-        elif platform == 'instagram':
-            result = await download_instagram(url)
-        elif platform == 'youtube':
-            result = await download_youtube(url)
-        elif platform == 'twitter':
-            result = await download_twitter(url)
-        elif platform == 'pinterest':
-            result = await download_pinterest(url)
-        else:
-            result = {"success": False, "error": "Platform tidak didukung"}
+        result = await do_download(
+            url, platform, audio_only=False,
+            bot=context.bot, chat_id=update.effective_chat.id,
+            status_msg_id=status_msg.message_id
+        )
 
         if result["success"]:
             file_path = Path(result["path"])
             file_size = result["size"]
 
+            # Cek limit Telegram
             if file_size > MAX_FILE_SIZE:
                 await status_msg.edit_text(
-                    f"❌ File terlalu besar ({file_size // 1024 // 1024}MB). Limit Telegram 50MB."
+                    f"❌ File terlalu besar ({format_size(file_size)}). "
+                    f"Limit Telegram 50MB."
                 )
                 return
 
-            caption = f"{emoji} *{result['title']}*\n👤 @{result['author']}"
+            # Info text
+            info_text = build_info_text(result, file_size)
+            caption = safe_caption(emoji, result["title"], result["author"], info_text)
 
-            if result.get("type") == "audio":
+            # Tombol download audio (jika video punya audio)
+            keyboard = None
+            if result.get("type") == "video":
+                cache_key = _cache_url(platform, url)
+                cb_data = f"a|{cache_key}"  # short! fits in 64 bytes
+                keyboard = InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🎵 Download Audio", callback_data=cb_data)
+                ]])
+
+            # Kirim media
+            if result.get("type") == "photo":
                 with open(file_path, 'rb') as f:
-                    await update.message.reply_audio(
-                        audio=f, caption=caption, parse_mode='Markdown',
-                        title=result["title"], performer=result["author"]
+                    await update.message.reply_photo(
+                        photo=f, caption=caption
                     )
             else:
                 with open(file_path, 'rb') as f:
                     await update.message.reply_video(
-                        video=f, caption=caption, parse_mode='Markdown',
-                        supports_streaming=True
+                        video=f, caption=caption,
+                        supports_streaming=True,
+                        reply_markup=keyboard
                     )
 
             await status_msg.delete()
@@ -381,6 +617,77 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status_msg.edit_text(f"❌ Error: {str(e)[:200]}")
 
 
+async def handle_audio_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handler tombol 'Download Audio' dari inline keyboard."""
+    query = update.callback_query
+
+    # Parse callback data
+    data = query.data or ""
+    parts = data.split("|", 1)
+    if len(parts) != 2 or parts[0] != "a":
+        await query.answer("Data tidak valid.", show_alert=True)
+        return
+
+    cached = _get_cached_url(parts[1])
+    if not cached:
+        await query.answer("Link sudah expired. Kirim ulang link-nya ya.", show_alert=True)
+        return
+
+    platform, url = cached
+
+    await query.answer("🎵 Memproses audio...")
+    status_msg = await query.message.reply_text(f"🎵 Extract audio dari {platform.title()}...")
+
+    try:
+        result = await do_download(
+            url, platform, audio_only=True,
+            bot=context.bot, chat_id=update.effective_chat.id,
+            status_msg_id=status_msg.message_id
+        )
+
+        if result["success"]:
+            file_path = Path(result["path"])
+            emoji = EMOJIS.get(platform, '🎵')
+            caption = safe_caption(emoji, result["title"], result["author"],
+                                   f"📦 {format_size(result['size'])}")
+
+            await safe_edit_msg(
+                context.bot, update.effective_chat.id,
+                status_msg.message_id, f"{emoji} Mengirim audio..."
+            )
+
+            with open(file_path, 'rb') as f:
+                await query.message.reply_audio(
+                    audio=f, caption=caption,
+                    title=result.get("title", "Audio"),
+                    performer=result.get("author", "unknown")
+                )
+
+            await status_msg.delete()
+            file_path.unlink(missing_ok=True)
+        else:
+            await status_msg.edit_text(
+                f"❌ Gagal extract audio.\n"
+                f"Error: {result.get('error', 'Unknown')[:200]}"
+            )
+
+    except Exception as e:
+        logger.error(f"Audio callback error: {e}")
+        await status_msg.edit_text(f"❌ Error: {str(e)[:200]}")
+
+
+async def safe_edit_msg(bot, chat_id: int, msg_id: int, text: str):
+    """Edit message dengan error handling."""
+    try:
+        await bot.edit_message_text(
+            chat_id=chat_id, message_id=msg_id, text=text
+        )
+    except (BadRequest, Exception):
+        pass
+
+
+# ===== MAIN =====
+
 def main():
     if not BOT_TOKEN:
         print("❌ BOT_TOKEN belum di-set!")
@@ -390,11 +697,19 @@ def main():
     print("🚀 Bot starting...")
     print(f"📁 Download dir: {DOWNLOAD_DIR}")
     print("✅ Support: TikTok, Instagram, YouTube Shorts, Twitter/X, Pinterest")
+    print("✅ Fitur: Universal audio, Progress bar, Inline audio button")
 
     app = Application.builder().token(BOT_TOKEN).build()
+
+    # Command handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("audio", audio_cmd))
+
+    # Callback handler untuk tombol audio
+    app.add_handler(CallbackQueryHandler(handle_audio_callback, pattern=r"^a\|"))
+
+    # Message handler (harus terakhir, paling rendah priority)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     print("✅ Bot berjalan!")
