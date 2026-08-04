@@ -155,13 +155,13 @@ def _parse_video_block(block: str) -> dict | None:
     
     # Download links — ambil semua MP4 links dengan quality
     mp4_links = re.findall(
-        r'href="(https://dl\.snapcdn\.app/get\?token=***"]+)"[^>]*>.*?Download MP4\s*\((\w+)\)',
+        r'href="(https://dl\.snapcdn\.app/get\?token=[^"]+)"[^>]*>.*?Download MP4\s*\((\w+)\)',
         block, re.DOTALL
     )
     
     if not mp4_links:
         # Fallback: cari semua snapcdn links
-        all_links = re.findall(r'href="(https://dl\.snapcdn\.app/get\?token=***"]+)"', block)
+        all_links = re.findall(r'href="(https://dl\.snapcdn\.app/get\?token=[^"]+)"', block)
         if all_links:
             return {
                 'best_url': all_links[0],
@@ -198,7 +198,7 @@ async def _handle_photo_from_html(html: str, download_dir: Path, unique: str) ->
     """Handle photo-only tweets dari HTML."""
     # Photo download link
     photo_links = re.findall(
-        r'href="(https://dl\.snapcdn\.app/get\?token=***"]+)"[^>]*>.*?Download Photo',
+        r'href="(https://dl\.snapcdn\.app/get\?token=[^"]+)"[^>]*>.*?Download Photo',
         html, re.DOTALL
     )
     
