@@ -28,6 +28,7 @@ from telegram.error import BadRequest
 import yt_dlp
 import httpx
 import hashlib
+import twitter_downloader
 
 # Logging
 logging.basicConfig(
@@ -107,7 +108,7 @@ PATTERNS = {
         re.I
     ),
     'twitter': re.compile(
-        r'https?://(?:www\.)?(?:twitter\.com|x\.com)/\w+/status/\d+[^\s]*',
+        r'https?://(?:www\.)?(?:twitter\.com|x\.com)/\w+/status/\d+[^\s]*|https?://t\.co/[^\s]+',
         re.I
     ),
     'pinterest': re.compile(
@@ -444,6 +445,15 @@ async def download_instagram_image(url: str) -> dict:
         return {"success": False, "error": str(e)[:200]}
 
 
+async def download_twitter(url: str, audio_only: bool = False) -> dict:
+    """Download Twitter/X media (video, photo, multi-photo, GIF)."""
+    try:
+        return await twitter_downloader.download_twitter(url, DOWNLOAD_DIR, audio_only=audio_only)
+    except Exception as e:
+        logger.error(f"Twitter download error: {e}")
+        return await download_with_ytdlp(url, "twitter", audio_only)
+
+
 async def download_generic(url: str, platform: str, audio_only: bool = False) -> dict:
     """Download dari platform lain via yt-dlp."""
     return await download_with_ytdlp(url, platform, audio_only)
@@ -684,6 +694,8 @@ async def do_download(url: str, platform: str, audio_only: bool,
         return await download_tiktok(url, audio_only=audio_only, progress_hook=progress_hook)
     elif platform == 'instagram':
         return await download_instagram(url)
+    elif platform == 'twitter':
+        return await download_twitter(url, audio_only=audio_only)
     else:
         return await download_with_ytdlp(url, platform, audio_only, progress_hook)
 
@@ -697,7 +709,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "✅ TikTok (video & audio)\n"
         "✅ Instagram (reel, carousel & foto)\n"
         "✅ YouTube Shorts\n"
-        "✅ Twitter/X video\n"
+        "✅ Twitter/X (video, foto, multi-foto, GIF)\n"
         "✅ Pinterest video/foto\n\n"
         "📌 *Commands:*\n"
         "• `/audio <link>` — download audio dari platform manapun\n"
@@ -719,7 +731,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• TikTok: `tiktok.com/...` atau `vm.tiktok.com/...`\n"
         "• Instagram: `instagram.com/reel/...` atau `/p/...`\n"
         "• YouTube: `youtube.com/shorts/...` atau `youtu.be/...`\n"
-        "• Twitter/X: `x.com/user/status/...`\n"
+        "• Twitter/X: `x.com/user/status/...` (video, foto, GIF)\n"
         "• Pinterest: `pinterest.com/...` atau `pin.it/...`",
         parse_mode='Markdown'
     )
@@ -826,7 +838,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             # Tombol download audio (jika video/photo punya audio)
             keyboard = None
-            if result.get("type") in ("video", "photos"):
+            if result.get("type") in ("video", "photos", "gif"):
                 cache_key = _cache_url(platform, url)
                 cb_data = f"a|{cache_key}"  # short! fits in 64 bytes
                 keyboard = InlineKeyboardMarkup([[
@@ -834,7 +846,41 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ]])
 
             # Kirim media
-            if result.get("type") == "photos":
+            # === TWITTER MULTI-PHOTO → kirim sebagai album ===
+            if result.get("type") == "photos" and platform == "twitter":
+                media_group = []
+                opened_files = []
+                for i, p in enumerate(result.get("paths", [])):
+                    img_path = Path(p)
+                    if img_path.exists():
+                        f = open(img_path, 'rb')
+                        opened_files.append(f)
+                        cap = caption if i == 0 else ""
+                        media_group.append(InputMediaPhoto(media=f, caption=cap))
+                if media_group:
+                    await update.message.reply_media_group(media=media_group)
+                for f in opened_files:
+                    f.close()
+                for p in result.get("paths", []):
+                    Path(p).unlink(missing_ok=True)
+                await status_msg.delete()
+                return
+
+            # === TWITTER GIF → kirim sebagai video ===
+            elif result.get("type") == "gif":
+                file_path = Path(result["path"])
+                with open(file_path, 'rb') as f:
+                    await update.message.reply_video(
+                        video=f, caption=caption,
+                        supports_streaming=True,
+                        reply_markup=keyboard
+                    )
+                file_path.unlink(missing_ok=True)
+                await status_msg.delete()
+                return
+
+            # === TikTok photo slideshow ===
+            elif result.get("type") == "photos":
                 # TikTok photo slideshow — tampilkan 3 opsi
                 slide_key = _cache_slideshow({
                     "paths": result["paths"],
@@ -1096,3 +1142,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
