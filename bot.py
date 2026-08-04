@@ -846,8 +846,28 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ]])
 
             # Kirim media
+            # === TWITTER MULTI-VIDEO → kirim satu per satu ===
+            if result.get("type") == "videos" and result.get("results"):
+                await status_msg.edit_text(f"🐦 Mendownload {len(result['results'])} video...")
+                for i, vid_result in enumerate(result['results']):
+                    if not vid_result.get("success"):
+                        continue
+                    vid_path = Path(vid_result["path"])
+                    if not vid_path.exists():
+                        continue
+                    vid_caption = safe_caption(emoji, vid_result["title"], vid_result["author"],
+                                               f"Video {i+1}/{len(result['results'])} | 📦 {format_size(vid_result['size'])}")
+                    with open(vid_path, 'rb') as f:
+                        await update.message.reply_video(
+                            video=f, caption=vid_caption,
+                            supports_streaming=True
+                        )
+                    vid_path.unlink(missing_ok=True)
+                await status_msg.delete()
+                return
+
             # === TWITTER MULTI-PHOTO → kirim sebagai album ===
-            if result.get("type") == "photos" and platform == "twitter":
+            elif result.get("type") == "photos" and platform == "twitter":
                 media_group = []
                 opened_files = []
                 for i, p in enumerate(result.get("paths", [])):
