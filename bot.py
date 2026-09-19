@@ -8,6 +8,7 @@ Fitur:
   - /audio universal (semua platform)
   - Progress download real-time
   - Support Instagram photo/carousel
+  - Keep-alive HTTP server (anti-sleep for free hosting)
 """
 
 import os
@@ -18,6 +19,25 @@ import logging
 import time
 from pathlib import Path
 from functools import partial
+from threading import Thread
+
+# Keep-alive server for Render/Koyeb free tier
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+class KeepAliveHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-type', 'text/plain')
+        self.end_headers()
+        self.wfile.write(b'Bot is running!')
+    def log_message(self, format, *args):
+        pass  # Suppress logs
+
+def start_keep_alive():
+    port = int(os.environ.get('PORT', 8080))
+    server = HTTPServer(('0.0.0.0', port), KeepAliveHandler)
+    print(f'🌐 Keep-alive server on port {port}')
+    server.serve_forever()
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.ext import (
@@ -1135,6 +1155,10 @@ def main():
         print("❌ BOT_TOKEN belum di-set!")
         print("   export BOT_TOKEN=your_token_here")
         return
+
+    # Start keep-alive server in background (for Render/Koyeb)
+    keep_alive_thread = Thread(target=start_keep_alive, daemon=True)
+    keep_alive_thread.start()
 
     print("🚀 Bot starting...")
     print(f"📁 Download dir: {DOWNLOAD_DIR}")
